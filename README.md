@@ -101,13 +101,81 @@ from rag import Channel
 pipeline = RAGPipeline(channels=(Channel.DENSE, Channel.BM25), rerank=True)
 ```
 
-## Architecture
+## Workflow
+
+Two phases: ingestion builds the indexes, querying runs a question through the retrieval tunnels and hands the winners to Claude.
 
 ```
-Ingest:   load → chunk → embed
-Retrieve: query → [dense | bm25 | lexical | entity] → RRF fusion → (MMR) → (rerank) → top-k chunks
-Generate: chunks + query → Claude → answer
+INGEST                                QUERY
+──────                                ─────
+ --file / --dir / --text               question
+        │                                  │
+        ▼                                  ├─────────────┬─────────────┬─────────────┐
+   loader reads text                       ▼             ▼             ▼             ▼
+        │                             DenseTunnel    BM25Tunnel   LexicalTunnel  EntityTunnel
+        ▼                             (embed query,  (keyword      (exact phrase (named-entity
+   chunker splits into                 vector store    relevance)    spans)        overlap)
+   overlapping chunks                  search)            │             │             │
+        │                                  │              │             │             │
+        ▼                                  └──────┬───────┴─────┬───────┴─────────────┘
+   embedder encodes chunks                        ▼             each tunnel over-fetches
+   (MiniLM, L2-normalised)               RRF fusion            top_k × candidate_multiplier
+        │                                (rank-based merge + dedup)
+        ▼                                         │
+   vector store add/upsert               MMR selection (--mmr, optional)
+   (FAISS in-memory, or                  diversity-aware top-k pick
+    Chroma persisted to disk)                     │
+                                         cross-encoder rerank (--rerank, optional)
+                                         joint (query, chunk) scoring
+                                                  │
+                                                  ▼
+                                         top-k chunks + question → Claude → streamed answer
 ```
+
+Step by step for a query:
+
+1. **Every enabled tunnel searches independently.** Dense embeds the query and searches the vector store; BM25, lexical, and entity search corpus indexes built lazily from the store's chunks (so they also work against a pre-populated Chroma DB). Each returns a ranked `(chunk, score)` list, over-fetching 4× `top_k` when a later stage will cut.
+2. **Reciprocal Rank Fusion merges the lists.** RRF scores by rank position only (`Σ 1/(k + rank)`), so the tunnels' incomparable score scales — cosine, BM25, span length, entity IDF — never need calibrating. Duplicates found by several tunnels rise to the top.
+3. **MMR (optional)** greedily picks a top-k that trades relevance against redundancy, so the context window isn't spent on near-duplicate chunks.
+4. **Cross-encoder rerank (optional)** re-scores each surviving (query, chunk) pair jointly for the final ordering — the most accurate stage, kept cheap by running only on the candidate pool.
+5. **Generation**: the top-k chunks are formatted with source/score attribution into the context of a Claude request, and the answer streams back.
+
+## Repository architecture
+
+```
+tiny_rag/
+├── main.py                        # CLI entry point (argparse → RAGPipeline)
+├── requirements.txt
+└── rag/
+    ├── pipeline.py                # RAGPipeline — the single public entry point, wires all stages
+    ├── ingest/
+    │   ├── loader.py              # read files / directories
+    │   ├── chunker.py             # fixed-size overlapping chunks
+    │   └── embedder.py            # sentence-transformers (all-MiniLM-L6-v2), L2-normalised vectors
+    ├── store/
+    │   ├── base.py                # BaseVectorStore ABC + StoreBackend enum
+    │   ├── document.py            # Chunk dataclass (text, source, chunk_index, metadata)
+    │   ├── vector_store.py        # FAISS backend (FLAT exact / HNSW approximate), in-memory
+    │   └── chroma_store.py        # Chroma backend: embedded-persistent, server, or ephemeral
+    ├── retrieve/
+    │   ├── retriever.py           # orchestrator: runs tunnels, RRF fusion, applies rerank stages
+    │   ├── retrieve_tunnel/       # the parallel retrieval tunnels
+    │   │   ├── base.py            # RetrieveTunnel ABC — all tunnels inherit this
+    │   │   ├── dense.py           # DenseTunnel: query embedding → vector store search
+    │   │   ├── bm25.py            # BM25Tunnel: Okapi BM25 keyword relevance
+    │   │   ├── lexical.py         # LexicalTunnel: exact phrase/span matching
+    │   │   ├── ner.py             # EntityTunnel: rule-based NER + IDF-weighted entity overlap
+    │   │   └── text.py            # shared tokenizer + stopwords
+    │   └── rerank/                # post-fusion stages, applied in order
+    │       ├── mmr.py             # MMR diversity selection
+    │       └── cross_encoder.py   # local cross-encoder reranker (ms-marco-MiniLM-L-6-v2)
+    └── generate/
+        └── generator.py           # Claude (claude-opus-4-8) with streaming, cited context
+```
+
+The dependency direction is one-way: `pipeline` → (`ingest`, `retrieve`, `generate`) → `store`. Tunnels never import each other; the retriever composes them. Swapping a piece (another embedding model, a new tunnel, a different vector DB) means implementing one small ABC — `RetrieveTunnel` for channels, `BaseVectorStore` for stores.
+
+## Architecture notes
 
 **Vector store** — two backends behind a common interface (`BaseVectorStore`):
 - `faiss` (default) — in-process, in-memory. `FLAT` gives exact cosine search; switch to `HNSW` for large corpora to get sub-linear query time at the cost of approximate results.
