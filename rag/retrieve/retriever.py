@@ -1,6 +1,7 @@
 from enum import Enum
 
 from rag.ingest.embedder import Embedder
+from rag.retrieve.query import QueryStage
 from rag.retrieve.rerank import MMRReranker, RerankStage
 from rag.retrieve.retrieve_tunnel import (
     BM25Tunnel,
@@ -56,6 +57,7 @@ class Retriever:
         rrf_k: int = 60,
         mmr_lambda: float | None = None,  # None = off; 0..1 trades relevance for diversity
         reranker: RerankStage | None = None,
+        query_stages: tuple[QueryStage, ...] = (),  # applied to the query before the tunnels
         candidate_multiplier: int = 4,  # pool size per tunnel = top_k * this, before fusion/rerank
     ):
         if not channels:
@@ -64,6 +66,7 @@ class Retriever:
         self.store = store
         self.channels = tuple(channels)
         self.rrf_k = rrf_k
+        self.query_stages = tuple(query_stages)
         self.candidate_multiplier = candidate_multiplier
         # rerank stages run in order over the fused pool; MMR first (selects
         # the final top_k), then any supplied stage re-orders the survivors
@@ -87,6 +90,9 @@ class Retriever:
         return tunnel
 
     def retrieve(self, query: str, top_k: int = 5) -> list[tuple[Chunk, float]]:
+        for stage in self.query_stages:
+            query = stage.process(query)
+
         # over-fetch when a later stage (fusion or rerank) will re-order and cut
         pool = top_k * self.candidate_multiplier if (
             len(self.channels) > 1 or self.stages

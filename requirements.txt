@@ -3,3 +3,5 @@ faiss-cpu
 sentence-transformers
 numpy
 chromadb
+pypdf
+python-docx

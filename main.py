@@ -19,8 +19,10 @@ from rag import Channel, DEFAULT_CHANNELS, RAGPipeline, StoreBackend
 def main() -> None:
     parser = argparse.ArgumentParser(description="Tiny RAG — ask questions over your documents")
     source = parser.add_mutually_exclusive_group()
-    source.add_argument("--file", metavar="PATH", help="Ingest a single text file")
-    source.add_argument("--dir", metavar="DIR", help="Ingest all .txt files in a directory")
+    source.add_argument("--file", metavar="PATH",
+                        help="Ingest a single file (.txt/.md/.pdf/.html/.docx)")
+    source.add_argument("--dir", metavar="DIR",
+                        help="Ingest all supported files in a directory")
     source.add_argument("--text", metavar="TEXT", help="Ingest raw text inline")
     parser.add_argument("question", help="Question to answer")
     parser.add_argument("--top-k", type=int, default=5, help="Number of chunks to retrieve (default: 5)")
@@ -53,6 +55,20 @@ def main() -> None:
         "--rerank", action="store_true",
         help="Rerank candidates with a local cross-encoder before generation",
     )
+    parser.add_argument(
+        "--no-spell", dest="spell", action="store_false",
+        help="Disable query spell correction against the corpus vocabulary (on by default)",
+    )
+    parser.add_argument(
+        "--rewrite", action="store_true",
+        help="Rewrite the query with Claude before retrieval (query understanding; "
+             "one extra API call per query)",
+    )
+    parser.add_argument(
+        "--contextualize", action="store_true",
+        help="Contextual retrieval: prepend a Claude-written 1-2 sentence document "
+             "context to each chunk at ingest (one API call per chunk)",
+    )
     args = parser.parse_args()
 
     try:
@@ -71,6 +87,9 @@ def main() -> None:
         channels=channels,
         mmr_lambda=args.mmr,
         rerank=args.rerank,
+        spell_correct=args.spell,
+        query_rewrite=args.rewrite,
+        contextualize=args.contextualize,
         persist_dir=args.persist_dir,
         chroma_host=args.chroma_host,
         chroma_port=args.chroma_port,

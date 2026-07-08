@@ -17,3 +17,13 @@ class Embedder:
     @property
     def dim(self) -> int:
         return self.model.get_sentence_embedding_dimension()
+
+    @property
+    def max_seq_length(self) -> int:
+        """Token window of the encoder — input beyond it is silently truncated."""
+        return int(self.model.max_seq_length)
+
+    @property
+    def max_chars(self) -> int:
+        """Rough character capacity of the encoder window (~4 chars/token)."""
+        return self.max_seq_length * 4
