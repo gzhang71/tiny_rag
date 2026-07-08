@@ -9,6 +9,8 @@ pip install -r requirements.txt
 export ANTHROPIC_API_KEY=sk-...
 ```
 
+Most of the system runs locally: embeddings (`all-MiniLM-L6-v2`), all four retrieval channels, spell correction, MMR, and the cross-encoder reranker need no network access. The API key is used for **answer generation** (every query) and the two opt-in Claude stages, `--rewrite` and `--contextualize`. The first run downloads the embedding model (~90 MB) from Hugging Face; `--rerank` additionally downloads the cross-encoder (~90 MB) on first use.
+
 ## Usage
 
 ```bash
@@ -22,7 +24,29 @@ python main.py --file path/to/report.pdf "What is the main topic?"
 python main.py --dir path/to/docs/ "Summarize the key points"
 ```
 
-Documents are cleaned (unicode/whitespace normalisation), split into sentence-aware chunks along section headings (each chunk keeps its heading breadcrumb, e.g. `[Configuration > Timeouts]`), deduplicated — exact and near-duplicate (SimHash) — and skipped entirely if a source's content hasn't changed since its last ingest. With `--contextualize`, Claude additionally writes a 1-2 sentence situating context for every chunk at ingest ([contextual retrieval](https://www.anthropic.com/news/contextual-retrieval)) — the strongest retrieval-accuracy lever, at the cost of one API call per chunk (the document is prompt-cached across calls).
+### Supported formats
+
+| Extension | Extractor | Structure |
+|---|---|---|
+| `.txt`, `.text` | plain read | none |
+| `.md`, `.markdown`, `.rst` | plain read | native `#` headings |
+| `.html`, `.htm` | stdlib parser (script/style stripped) | `<h1>`–`<h6>` → `#` headings |
+| `.docx` | `python-docx` | `Heading N` styles → `#` headings |
+| `.pdf` | `pypdf` | flat text, pages joined |
+
+All extractors emit markdown-style `#` heading lines, which the chunker uses for structure-aware chunking — so an HTML page and the equivalent Markdown file chunk identically.
+
+### What happens at ingest
+
+1. **Clean** — unicode NFKC normalisation, unified newlines, control characters stripped, whitespace collapsed.
+2. **Skip if unchanged** — the cleaned document is content-hashed; if that source was already ingested with the same hash, ingestion returns immediately (`Ingested 0 chunks`). With a persistent Chroma store this works across runs, so re-running `--dir` on a mostly-unchanged corpus only re-embeds the files that actually changed.
+3. **Chunk** — the document is split into sections along headings; within each section, whole sentences (including CJK `。！？` boundaries) are packed into chunks of at most `--chunk-size` characters, with the trailing sentences (~`--overlap` chars) carried into the next chunk. Chunks are prefixed with their heading breadcrumb, e.g. `[Configuration > Timeouts] Retries default to three.`
+4. **Filter noise** — chunks that are near-empty or mostly non-letters (page numbers, `--- 42 ---` separators, header/footer debris) are dropped.
+5. **Deduplicate** — exact copies (order-insensitive token-set hash) and near-duplicates (64-bit SimHash within 8 bits — a passage with a few words changed) are dropped, including against chunks already in a persisted store.
+6. **Contextualize (optional, `--contextualize`)** — Claude writes a 1-2 sentence context situating each chunk in its document ([contextual retrieval](https://www.anthropic.com/news/contextual-retrieval)), prepended to the chunk text so *every* retrieval channel benefits, not just the dense one. A chunk like "It rose by 3%." becomes findable for "ACME Q3 revenue". Costs one API call per chunk; the document is sent with a prompt-cache breakpoint, so calls after the first read it at ~10% of input price.
+7. **Embed and store** — chunks are encoded (L2-normalised MiniLM vectors) and upserted into the vector store.
+
+A warning is printed if `--chunk-size` exceeds what the embedding model can encode (~1024 characters for MiniLM's 256-token window): oversized chunks still ingest, but dense retrieval only "sees" each chunk's head, while BM25/lexical/entity still see all of it.
 
 ### Persistent vector DB (Chroma)
 
@@ -61,13 +85,26 @@ All four are on by default; pick a subset with `--channels`. Two optional post-f
 
 And two query-preprocessing stages that run before the tunnels:
 
-- **Spell correction** (on by default, `--no-spell` disables) — query typos are fixed against the ingested corpus vocabulary ("embeding" → "embedding"); identifiers and novel terms are left alone. Local, no API call.
-- `--rewrite` — query understanding: Claude rewrites the query for retrieval (expands acronyms, adds synonyms) before the tunnels run. One extra API call per query.
+- **Spell correction** (on by default, `--no-spell` disables) — query typos are fixed against the ingested corpus vocabulary ("embeding" → "embedding"), so it never needs a dictionary and adapts to domain jargon automatically. Guardrails keep it conservative: only pure-alphabetic words of 4+ characters are candidates, words already in the corpus are never touched, and corrections stay within edit distance 1 (short words) or 2 (longer) — so ticket ids, version strings, and genuinely novel terms pass through untouched. Local, no API call.
+- `--rewrite` — query understanding: Claude rewrites the query for retrieval (expands acronyms and ambiguous references, adds synonyms of key terms, fixes grammar) before the tunnels run, preserving identifiers verbatim. Falls back to the original query if the model declines. One extra API call per query.
 
 ```bash
 python main.py --channels dense,bm25 --mmr --rerank --file doc.txt "What changed in v2.3?"
 python main.py --rewrite --file doc.txt "hw does the ingest pipline work?"
 ```
+
+### Which flags should I turn on?
+
+| Situation | Reach for |
+|---|---|
+| Default: small corpus, quick answers | nothing — the four fused channels are already strong |
+| Users type fast and make typos | nothing — spell correction is already on |
+| Chunks in results feel repetitive / near-identical | `--mmr` (lower lambda → more diversity) |
+| Top results are close but ordered badly | `--rerank` (local, adds ~a second) |
+| Queries are terse, jargon-heavy, or full of acronyms | `--rewrite` (1 API call/query) |
+| Chunks lose meaning out of context ("It rose 3%") | `--contextualize` at ingest (1 API call/chunk, biggest accuracy lever) |
+| Corpus grows past ~10k chunks | FAISS `IndexType.HNSW` (Python API) or `--store chroma` |
+| Same corpus queried repeatedly | `--store chroma` — ingest once, unchanged files skipped on re-ingest |
 
 ### Options
 
@@ -110,7 +147,37 @@ print(pipeline.query("What are the key themes?"))
 # choose retrieval channels and add cross-encoder reranking
 from rag import Channel
 pipeline = RAGPipeline(channels=(Channel.DENSE, Channel.BM25), rerank=True)
+
+# everything on: diverse results, reranked, LLM query rewrite + contextual retrieval
+pipeline = RAGPipeline(mmr_lambda=0.7, rerank=True, query_rewrite=True, contextualize=True)
+pipeline.ingest_file("report.pdf")
+print(pipeline.query("What drove the Q3 revenue change?"))
+
+# retrieval without generation — returns [(Chunk, score), ...]
+for chunk, score in pipeline.retriever.retrieve("timeout defaults", top_k=3):
+    print(f"{score:.3f}  [{chunk.source}:{chunk.chunk_index}]  {chunk.text[:80]}")
 ```
+
+### `RAGPipeline` parameters
+
+| Parameter | Default | Description |
+|---|---|---|
+| `chunk_size` / `overlap` | 512 / 64 | Chunk size and carried overlap, in characters |
+| `top_k` | 5 | Chunks handed to the generator |
+| `backend` | `StoreBackend.FAISS` | `FAISS` (in-memory) or `CHROMA` (persistent) |
+| `channels` | all four | Retrieval channels to run and fuse |
+| `rrf_k` | 60 | RRF fusion constant (higher = flatter rank weighting) |
+| `mmr_lambda` | `None` (off) | MMR diversity stage; 0..1, higher = more relevance |
+| `rerank` | `False` | Cross-encoder rerank stage (local model) |
+| `spell_correct` | `True` | Corpus-vocabulary query spell correction |
+| `query_rewrite` | `False` | LLM query rewrite before retrieval (1 call/query) |
+| `contextualize` | `False` | Contextual retrieval at ingest (1 call/chunk) |
+| `index_type` | `IndexType.FLAT` | FAISS only: `FLAT` exact or `HNSW` approximate |
+| `persist_dir` | `./chroma_db` | Chroma only: embedded DB directory (`None` = in-memory) |
+| `collection` | `tiny_rag` | Chroma only: collection name |
+| `chroma_host` / `chroma_port` | `None` / 8000 | Chroma only: connect to a `chroma run` server |
+
+`ingest_text(text, source)`, `ingest_file(path)`, and `ingest_directory(dir, glob=None)` all return the number of chunks actually stored — `0` means the content was unchanged or fully deduplicated, not that ingestion failed.
 
 ## Workflow
 
@@ -202,7 +269,39 @@ tiny_rag/
         └── generator.py           # Claude (claude-opus-4-8) with streaming, cited context
 ```
 
-The dependency direction is one-way: `pipeline` → (`ingest`, `retrieve`, `generate`) → `store`. Tunnels never import each other; the retriever composes them. Swapping a piece (another embedding model, a new tunnel, a different vector DB) means implementing one small ABC — `RetrieveTunnel` for channels, `BaseVectorStore` for stores.
+The dependency direction is one-way: `pipeline` → (`ingest`, `retrieve`, `generate`) → `store`. Tunnels never import each other; the retriever composes them. Swapping a piece (another embedding model, a new tunnel, a different vector DB) means implementing one small ABC — `RetrieveTunnel` for channels, `BaseVectorStore` for stores, `QueryStage` for query preprocessing, `RerankStage` for post-fusion stages.
+
+## Extending
+
+Each seam in the pipeline is a small ABC; add a class, wire it in, done.
+
+**A new file format** — add a branch in `loader.py::load_file` and the extension to `SUPPORTED_SUFFIXES`. Emit markdown `#` heading lines wherever the format has sections and the structure-aware chunker picks them up for free.
+
+**A new query-preprocessing stage** (e.g. acronym expansion from a project glossary):
+
+```python
+from rag.retrieve.query.base import QueryStage
+
+class GlossaryExpander(QueryStage):
+    def __init__(self, glossary: dict[str, str]):
+        self.glossary = glossary
+
+    def process(self, query: str) -> str:
+        for term, expansion in self.glossary.items():
+            query = query.replace(term, f"{term} ({expansion})")
+        return query
+
+# pass to the retriever (order matters — stages run left to right)
+pipeline.retriever.query_stages = (*pipeline.retriever.query_stages, GlossaryExpander({...}))
+```
+
+**A new retrieval tunnel** — subclass `RetrieveTunnel` (`search(query, top_k) -> list[(Chunk, score)]` + `__len__`). Scores only need to be self-consistent: fusion is rank-based, so they're never compared across tunnels.
+
+**A new rerank stage** — subclass `RerankStage` (`rerank(query, candidates, top_k)`) and append it to `pipeline.retriever.stages`; each stage receives the previous one's output.
+
+**A better NER model** — `rag/retrieve/retrieve_tunnel/ner.py::extract_entities` is the single swap point; replace the regex rules with a spaCy or transformer NER and the entity tunnel picks it up unchanged.
+
+**A different embedding model** — `Embedder(model_name="...")` accepts any sentence-transformers model; the stores read the dimension from it. For multilingual corpora, e.g. `paraphrase-multilingual-MiniLM-L12-v2`.
 
 ## Architecture notes
 
