@@ -1,6 +1,6 @@
 from sentence_transformers import CrossEncoder
 
-from rag.retrieve.rerank.base import RerankStage
+from rag.reranking.base import RerankStage
 from rag.store.document import Chunk
 
 _MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"

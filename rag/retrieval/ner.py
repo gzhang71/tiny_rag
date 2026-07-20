@@ -10,8 +10,8 @@ import math
 import re
 from collections import Counter
 
-from rag.retrieve.retrieve_tunnel.base import RetrieveTunnel
-from rag.retrieve.retrieve_tunnel.text import STOPWORDS
+from rag.retrieval.base import RetrieveTunnel
+from rag.retrieval.text import STOPWORDS
 from rag.store.document import Chunk
 
 _PATTERNS = [

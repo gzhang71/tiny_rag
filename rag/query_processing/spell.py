@@ -10,7 +10,7 @@ alone. Needs no external dependency or API call.
 import re
 from collections import Counter
 
-from rag.retrieve.query.base import QueryStage
+from rag.query_processing.base import QueryStage
 from rag.store.base import BaseVectorStore
 
 _WORD = re.compile(r"[A-Za-z]+")

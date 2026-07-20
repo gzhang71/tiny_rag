@@ -1,14 +1,16 @@
 import warnings
 
+from rag.context_engineering import ContextCompressor, ContextPacker, ContextStage
 from rag.generate.generator import Generator
 from rag.ingest.chunker import chunk_text
 from rag.ingest.cleaner import ChunkDeduper, clean_text, content_hash
 from rag.ingest.embedder import Embedder
 from rag.ingest.loader import load_file, load_directory
-from rag.retrieve.query import QueryStage, SpellCorrector
-from rag.retrieve.rerank import CrossEncoderReranker
-from rag.retrieve.retriever import Channel, DEFAULT_CHANNELS, Retriever
+from rag.query_processing import QueryExpander, QueryStage, SpellCorrector
+from rag.reranking import CrossEncoderReranker
+from rag.retrieval.retriever import Channel, DEFAULT_CHANNELS, Retriever
 from rag.store.base import BaseVectorStore, StoreBackend
+from rag.store.document import Chunk
 from rag.store.vector_store import IndexType, VectorStore
 
 
@@ -24,9 +26,14 @@ class RAGPipeline:
         mmr_lambda: float | None = None,
         rerank: bool = False,
         rrf_k: int = 60,
-        # query preprocessing
+        # query processing
         spell_correct: bool = True,   # corpus-vocab typo correction, local
         query_rewrite: bool = False,  # LLM query understanding, one Claude call per query
+        decompose: bool = False,      # LLM multi-hop decomposition, one Claude call per query
+        hyde: bool = False,           # LLM hypothetical answer passage, one Claude call per query
+        # context engineering (between retrieval and generation)
+        compress: bool = False,             # extractive sentence compression, local embeddings
+        context_budget: int | None = None,  # char budget for the packed context, None = off
         # ingest enrichment
         contextualize: bool = False,  # contextual retrieval, one Claude call per chunk
         # FAISS-specific
@@ -69,9 +76,21 @@ class RAGPipeline:
             query_stages.append(SpellCorrector(self.store))
         if query_rewrite:
             # imported lazily so query rewriting stays an opt-in Claude dependency
-            from rag.retrieve.query.rewrite import QueryRewriter
+            from rag.query_processing.rewrite import QueryRewriter
 
             query_stages.append(QueryRewriter())
+
+        query_expanders: list[QueryExpander] = []
+        if decompose:
+            # imported lazily so decomposition stays an opt-in Claude dependency
+            from rag.query_processing.decompose import QueryDecomposer
+
+            query_expanders.append(QueryDecomposer())
+        if hyde:
+            # imported lazily so HyDE stays an opt-in Claude dependency
+            from rag.query_processing.hyde import HyDEExpander
+
+            query_expanders.append(HyDEExpander())
 
         self.retriever = Retriever(
             self.embedder,
@@ -81,7 +100,17 @@ class RAGPipeline:
             mmr_lambda=mmr_lambda,
             reranker=CrossEncoderReranker() if rerank else None,
             query_stages=tuple(query_stages),
+            query_expanders=tuple(query_expanders),
         )
+
+        # context stages run in order between retrieval and generation:
+        # compress first (shrinks chunks), then pack into the budget
+        self.context_stages: list[ContextStage] = []
+        if compress:
+            self.context_stages.append(ContextCompressor(self.embedder))
+        if context_budget is not None:
+            self.context_stages.append(ContextPacker(max_chars=context_budget))
+
         self.generator = Generator()
 
         self.contextualizer = None
@@ -138,8 +167,17 @@ class RAGPipeline:
             total += self.ingest_text(text, source=source)
         return total
 
+    def prepare_context(
+        self, question: str, chunks: list[tuple[Chunk, float]]
+    ) -> list[tuple[Chunk, float]]:
+        """Apply the enabled context-engineering stages to retrieved chunks."""
+        for stage in self.context_stages:
+            chunks = stage.apply(question, chunks)
+        return chunks
+
     def query(self, question: str) -> str:
         if len(self.store) == 0:
             raise RuntimeError("No documents ingested. Call ingest_text/ingest_file first.")
         chunks = self.retriever.retrieve(question, top_k=self.top_k)
+        chunks = self.prepare_context(question, chunks)
         return self.generator.generate(question, chunks)

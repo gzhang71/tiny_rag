@@ -1,15 +1,13 @@
 from enum import Enum
 
 from rag.ingest.embedder import Embedder
-from rag.retrieve.query import QueryStage
-from rag.retrieve.rerank import MMRReranker, RerankStage
-from rag.retrieve.retrieve_tunnel import (
-    BM25Tunnel,
-    DenseTunnel,
-    EntityTunnel,
-    LexicalTunnel,
-    RetrieveTunnel,
-)
+from rag.query_processing import QueryExpander, QueryStage
+from rag.reranking import MMRReranker, RerankStage
+from rag.retrieval.base import RetrieveTunnel
+from rag.retrieval.bm25 import BM25Tunnel
+from rag.retrieval.dense import DenseTunnel
+from rag.retrieval.lexical import LexicalTunnel
+from rag.retrieval.ner import EntityTunnel
 from rag.store.base import BaseVectorStore
 from rag.store.document import Chunk
 
@@ -58,6 +56,7 @@ class Retriever:
         mmr_lambda: float | None = None,  # None = off; 0..1 trades relevance for diversity
         reranker: RerankStage | None = None,
         query_stages: tuple[QueryStage, ...] = (),  # applied to the query before the tunnels
+        query_expanders: tuple[QueryExpander, ...] = (),  # fan the query out into several, RRF-fused
         candidate_multiplier: int = 4,  # pool size per tunnel = top_k * this, before fusion/rerank
     ):
         if not channels:
@@ -67,6 +66,7 @@ class Retriever:
         self.channels = tuple(channels)
         self.rrf_k = rrf_k
         self.query_stages = tuple(query_stages)
+        self.query_expanders = tuple(query_expanders)
         self.candidate_multiplier = candidate_multiplier
         # rerank stages run in order over the fused pool; MMR first (selects
         # the final top_k), then any supplied stage re-orders the survivors
@@ -93,17 +93,30 @@ class Retriever:
         for stage in self.query_stages:
             query = stage.process(query)
 
+        # expanders fan the query out into several (sub-questions, HyDE
+        # passages); each is run through every tunnel and all lists are fused
+        queries = [query]
+        for expander in self.query_expanders:
+            seen = {q.lower() for q in queries}
+            for expanded in (e for q in queries for e in expander.expand(q)):
+                if expanded.lower() not in seen:
+                    seen.add(expanded.lower())
+                    queries.append(expanded)
+
         # over-fetch when a later stage (fusion or rerank) will re-order and cut
         pool = top_k * self.candidate_multiplier if (
-            len(self.channels) > 1 or self.stages
+            len(self.channels) > 1 or len(queries) > 1 or self.stages
         ) else top_k
 
-        result_lists = [self._tunnel(ch).search(query, top_k=pool) for ch in self.channels]
+        result_lists = [
+            self._tunnel(ch).search(q, top_k=pool) for q in queries for ch in self.channels
+        ]
         if len(result_lists) == 1:
             candidates = result_lists[0]
         else:
             candidates = _rrf_fuse(result_lists, k=self.rrf_k)
 
+        # rerank stages see the user's (processed) query, not the expansions
         for stage in self.stages:
             candidates = stage.rerank(query, candidates, top_k=top_k)
         return candidates[:top_k]

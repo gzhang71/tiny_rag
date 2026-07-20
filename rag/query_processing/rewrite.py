@@ -7,7 +7,7 @@ model returns nothing usable.
 """
 import anthropic
 
-from rag.retrieve.query.base import QueryStage
+from rag.query_processing.base import QueryStage
 
 _MODEL = "claude-opus-4-8"
 

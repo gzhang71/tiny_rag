@@ -23,9 +23,16 @@ python3 main.py --store chroma "Follow-up question"
 # retrieval tunnels (default: all four, RRF-fused), MMR diversity, cross-encoder rerank
 python3 main.py --channels dense,bm25 --mmr 0.7 --rerank --file doc.txt "Question"
 
-# query preprocessing: spell correction is on by default (--no-spell disables);
-# --rewrite adds an LLM query-understanding pass (one Claude call per query)
+# query processing: spell correction is on by default (--no-spell disables);
+# --rewrite adds an LLM query-understanding pass, --decompose splits multi-hop
+# questions into sub-questions, --hyde retrieves with an LLM-written
+# hypothetical answer passage (each: one Claude call per query)
 python3 main.py --rewrite --file doc.txt "hw does the pipline work?"
+python3 main.py --decompose --hyde --file doc.txt "How do dedupe and Chroma interact?"
+
+# context engineering (local, no API call): --compress cuts chunks to their
+# query-relevant sentences, --context-budget packs into a char budget
+python3 main.py --compress --context-budget 4000 --dir docs/ "Summarize the risks"
 
 # .pdf / .html / .docx / .md are supported; --contextualize adds contextual
 # retrieval (a Claude-written situating context per chunk, one call per chunk)
@@ -34,7 +41,7 @@ python3 main.py --contextualize --file report.pdf "What were the Q3 numbers?"
 
 ## Architecture
 
-`RAGPipeline` (in `rag/pipeline.py`) is the single public entry point. It wires together four independent stages:
+`RAGPipeline` (in `rag/pipeline.py`) is the single public entry point. It wires together the pipeline stages; `rag/evaluation/` sits on top and drives the pipeline for measurement:
 
 1. **Ingest** (`rag/ingest/`) —
    - `loader.py` reads files/directories with per-format extraction: `.txt`/`.md` natively, `.pdf` via `pypdf`, `.docx` via `python-docx`, `.html` via a stdlib parser — HTML/docx headings are synthesised as markdown `#` lines so all formats feed the same structure-aware chunker. `pypdf`/`python-docx` are imported lazily. `load_directory` picks up all supported extensions by default (pass `glob` to restrict).
@@ -51,25 +58,38 @@ python3 main.py --contextualize --file report.pdf "What were the Q3 numbers?"
 
    Both backends rely on L2-normalised vectors and return cosine-similarity scores.
 
-3. **Retrieve** (`rag/retrieve/`) — before the tunnels run, optional query-preprocessing stages (`rag/retrieve/query/`, all implementing the `QueryStage` ABC in `query/base.py`: `process(query) -> str`, applied in order by `Retriever.query_stages`) transform the query:
-   - `SpellCorrector` (`query/spell.py`, on by default) — corpus-driven typo correction: query words absent from the store's vocabulary (rebuilt lazily on store-size change, like the corpus tunnels) are replaced by the closest vocab word within edit distance 1–2, preferring frequent words; only pure-alphabetic words of 4+ chars are touched, so ids/codes/novel terms survive.
-   - `QueryRewriter` (`query/rewrite.py`, opt-in via `query_rewrite=True`) — LLM query understanding: one short Claude call (`claude-opus-4-8`, `effort: low`) rewrites the query for retrieval (typos, acronyms, synonyms), falling back to the original on refusal/empty output. Imported lazily in `pipeline.py`.
+3. **Query processing** (`rag/query_processing/`) — transforms the query before the tunnels run. Two ABCs in `base.py`:
 
-   Then multi-tunnel retrieval: each enabled `Channel` produces a ranked list and the lists are fused with Reciprocal Rank Fusion (`_rrf_fuse` in `retriever.py`, rank-based so per-tunnel score scales never need calibrating). Tunnels live in `rag/retrieve/retrieve_tunnel/` and all inherit the `RetrieveTunnel` ABC (`base.py`: `search(query, top_k) -> list[(Chunk, score)]` + `__len__`):
+   `QueryStage` (`process(query) -> str`, applied in order by `Retriever.query_stages`):
+   - `SpellCorrector` (`spell.py`, on by default) — corpus-driven typo correction: query words absent from the store's vocabulary (rebuilt lazily on store-size change, like the corpus tunnels) are replaced by the closest vocab word within edit distance 1–2, preferring frequent words; only pure-alphabetic words of 4+ chars are touched, so ids/codes/novel terms survive.
+   - `QueryRewriter` (`rewrite.py`, opt-in via `query_rewrite=True`) — LLM query understanding: one short Claude call (`claude-opus-4-8`, `effort: low`) rewrites the query for retrieval (typos, acronyms, synonyms), falling back to the original on refusal/empty output. Imported lazily in `pipeline.py`.
+
+   `QueryExpander` (`expand(query) -> list[str]`, applied by `Retriever.query_expanders`; every resulting query runs through every tunnel and all ranked lists are RRF-fused together):
+   - `QueryDecomposer` (`decompose.py`, opt-in via `decompose=True`) — one Claude call splits a multi-hop question into ≤4 self-contained sub-questions (replies `ATOMIC` for single-need questions → no expansion); the original query stays in the pool. Imported lazily.
+   - `HyDEExpander` (`hyde.py`, opt-in via `hyde=True`) — HyDE: one Claude call writes a short hypothetical answer passage, retrieved alongside the original query (its embedding lands near real answer passages; its vocabulary feeds the sparse tunnels). Imported lazily.
+
+4. **Retrieval** (`rag/retrieval/`) — multi-tunnel hybrid search: each enabled `Channel` produces a ranked list per query and the lists are fused with Reciprocal Rank Fusion (`_rrf_fuse` in `retriever.py`, rank-based so per-tunnel score scales never need calibrating). All tunnels inherit the `RetrieveTunnel` ABC (`base.py`: `search(query, top_k) -> list[(Chunk, score)]` + `__len__`):
    - `DenseTunnel` (`dense.py`) — embeds the query, searches the vector store (semantic).
    - `BM25Tunnel` (`bm25.py`) — self-contained Okapi BM25, sparse keyword relevance.
    - `LexicalTunnel` (`lexical.py`) — exact phrase matching; longest contiguous query span found verbatim in a chunk (pure-stopword spans don't count).
    - `EntityTunnel` (`ner.py`) — rule-based NER (regex: ticket ids, codes, emails, URLs, versions, ISO dates, proper-noun spans) scored by IDF-weighted entity overlap; `extract_entities` is the swap point for a spaCy/transformer model.
 
-   All tunnels except dense are corpus indexes built lazily from `store.chunks()` and rebuilt when the store size changes (works with pre-populated persisted stores); shared tokenizer/stopwords in `retrieve_tunnel/text.py`.
+   All tunnels except dense are corpus indexes built lazily from `store.chunks()` and rebuilt when the store size changes (works with pre-populated persisted stores); shared tokenizer/stopwords in `rag/retrieval/text.py`. `Retriever` (`retriever.py`) orchestrates stages → expanders → tunnels → fusion → rerank; tunnels over-fetch `top_k * candidate_multiplier` when fusion, multiple queries, or a later stage will cut. Returns `list[tuple[Chunk, float]]`; score semantics depend on the last stage (cosine / RRF / MMR objective / cross-encoder logit).
 
-   Post-fusion rerank stages (`rag/retrieve/rerank/`) all inherit the `RerankStage` ABC (`rerank/base.py`: `rerank(query, candidates, top_k) -> list[(Chunk, score)]`); `Retriever` applies its enabled stages in order (`Retriever.stages`), each receiving the previous stage's output:
-   - **MMR** (`rerank/mmr.py`, `MMRReranker`) — optional diversity-aware selection: greedily maximises `λ·relevance − (1−λ)·max-sim-to-selected` over fresh chunk embeddings; picks the final `top_k` from the fused pool. Enabled by `mmr_lambda` (None = off).
-   - **Cross-encoder** (`rerank/cross_encoder.py`, `CrossEncoderReranker`) — optional local cross-encoder (`ms-marco-MiniLM-L-6-v2`) re-scores candidates (after MMR it only re-orders the survivors).
+5. **Reranking** (`rag/reranking/`) — post-fusion stages, all inheriting the `RerankStage` ABC (`base.py`: `rerank(query, candidates, top_k) -> list[(Chunk, score)]`); `Retriever` applies its enabled stages in order (`Retriever.stages`), each receiving the previous stage's output, with the user's (processed, un-expanded) query:
+   - **MMR** (`mmr.py`, `MMRReranker`) — optional diversity-aware selection: greedily maximises `λ·relevance − (1−λ)·max-sim-to-selected` over fresh chunk embeddings; picks the final `top_k` from the fused pool. Enabled by `mmr_lambda` (None = off).
+   - **Cross-encoder** (`cross_encoder.py`, `CrossEncoderReranker`) — optional local cross-encoder (`ms-marco-MiniLM-L-6-v2`) re-scores candidates (after MMR it only re-orders the survivors).
 
-   Tunnels over-fetch `top_k * candidate_multiplier` when any later stage will cut. Returns `list[tuple[Chunk, float]]`; score semantics depend on the last stage (cosine / RRF / MMR objective / cross-encoder logit).
+6. **Context engineering** (`rag/context_engineering/`) — shapes the retrieved chunks between retrieval and generation. Stages inherit the `ContextStage` ABC (`base.py`: `apply(query, chunks) -> chunks`), applied in order by `RAGPipeline.prepare_context` (`pipeline.context_stages`); stages return copies and never mutate the store's chunk objects:
+   - `ContextCompressor` (`compression.py`, opt-in via `compress=True`) — extractive compression: splits each chunk into sentences, scores them against the query with the local embedder (one batched encode, no API call), keeps the top `keep` fraction (default 0.6) in original order; chunks under 3 sentences pass through; original length recorded in `metadata["compressed_from_chars"]`.
+   - `ContextPacker` (`packing.py`, opt-in via `context_budget=N`) — drops query-time near-duplicates (token-set Jaccard ≥ 0.85), greedily fits the best-scoring survivors into the char budget, then re-orders into `(source, chunk_index)` document order.
 
-4. **Generate** (`rag/generate/generator.py`) — passes retrieved chunks as context to Claude (`claude-opus-4-8`) via the Anthropic SDK with adaptive thinking and streaming.
+7. **Generate** (`rag/generate/generator.py`) — passes the prepared chunks as context to Claude (`claude-opus-4-8`) via the Anthropic SDK with adaptive thinking and streaming.
+
+**Evaluation** (`rag/evaluation/`) — not a pipeline stage; drives the pipeline over a labelled dataset:
+   - `metrics.py` — `recall_at_k` / `ndcg_at_k`, pure functions over id sequences (ids are `source` or `"source:chunk_index"`; NDCG accepts a set for binary or a mapping for graded relevance).
+   - `judge.py` (`LLMJudge`) — one structured-output Claude call per (question, context, answer): decomposes the answer into atomic claims labelled supported / not_in_context / contradicted plus a holistic 0-1 groundedness score. Faithfulness = supported/total (RAGAS definition); hallucination rate = 1 − faithfulness. Returns `None` on refusal.
+   - `evaluator.py` (`RAGEvaluator(pipeline, judge=None).evaluate(dataset)`) — takes `EvalExample(question, relevant=[ids])`; always computes Recall@K/NDCG@K from `pipeline.retriever.retrieve`; with a judge it also runs `prepare_context` + the generator and judges the answer. Aggregates into `EvalReport` (means + `summary()`; per-example detail in `.results`).
 
 All imports are absolute from the `rag` package root (e.g. `from rag.store.document import Chunk`). The project root must be on `sys.path` (running `python3 main.py` from `tiny_rag/` handles this automatically).
 
@@ -80,6 +100,10 @@ All imports are absolute from the `rag` package root (e.g. `from rag.store.docum
 | `channels` | `RAGPipeline(channels=(Channel.DENSE, Channel.BM25))` | all four |
 | `spell_correct` | `RAGPipeline(spell_correct=False)` — corpus-vocab query typo correction | `True` |
 | `query_rewrite` | `RAGPipeline(query_rewrite=True)` — LLM query rewrite before retrieval | `False` |
+| `decompose` | `RAGPipeline(decompose=True)` — LLM multi-hop decomposition into sub-questions | `False` |
+| `hyde` | `RAGPipeline(hyde=True)` — HyDE hypothetical answer passage | `False` |
+| `compress` | `RAGPipeline(compress=True)` — extractive sentence compression (local) | `False` |
+| `context_budget` | `RAGPipeline(context_budget=4000)` — char budget for packed context, None = off | `None` |
 | `contextualize` | `RAGPipeline(contextualize=True)` — contextual retrieval at ingest | `False` |
 | `mmr_lambda` | `RAGPipeline(mmr_lambda=0.7)` — MMR diversity stage, None = off | `None` |
 | `rerank` | `RAGPipeline(rerank=True)` — cross-encoder rerank stage | `False` |

@@ -5,8 +5,8 @@ contain contiguous spans of the query verbatim (the equivalent of a
 `match_phrase` clause in Elasticsearch). A chunk containing a longer exact
 span of the query outranks one with scattered term hits.
 """
-from rag.retrieve.retrieve_tunnel.base import RetrieveTunnel
-from rag.retrieve.retrieve_tunnel.text import STOPWORDS, tokenize
+from rag.retrieval.base import RetrieveTunnel
+from rag.retrieval.text import STOPWORDS, tokenize
 from rag.store.document import Chunk
 
 

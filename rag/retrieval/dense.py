@@ -1,6 +1,6 @@
 """Dense retrieval tunnel — semantic similarity via the vector store."""
 from rag.ingest.embedder import Embedder
-from rag.retrieve.retrieve_tunnel.base import RetrieveTunnel
+from rag.retrieval.base import RetrieveTunnel
 from rag.store.base import BaseVectorStore
 from rag.store.document import Chunk
 

@@ -65,6 +65,26 @@ def main() -> None:
              "one extra API call per query)",
     )
     parser.add_argument(
+        "--decompose", action="store_true",
+        help="Decompose multi-hop questions into sub-questions with Claude; each is "
+             "retrieved separately and RRF-fused (one extra API call per query)",
+    )
+    parser.add_argument(
+        "--hyde", action="store_true",
+        help="HyDE: retrieve with a Claude-written hypothetical answer passage "
+             "alongside the query (one extra API call per query)",
+    )
+    parser.add_argument(
+        "--compress", action="store_true",
+        help="Compress retrieved chunks to their query-relevant sentences before "
+             "generation (local embeddings, no API call)",
+    )
+    parser.add_argument(
+        "--context-budget", type=int, default=None, metavar="CHARS",
+        help="Pack the generator context to at most CHARS characters, dropping "
+             "near-duplicate chunks and re-ordering into document order",
+    )
+    parser.add_argument(
         "--contextualize", action="store_true",
         help="Contextual retrieval: prepend a Claude-written 1-2 sentence document "
              "context to each chunk at ingest (one API call per chunk)",
@@ -89,6 +109,10 @@ def main() -> None:
         rerank=args.rerank,
         spell_correct=args.spell,
         query_rewrite=args.rewrite,
+        decompose=args.decompose,
+        hyde=args.hyde,
+        compress=args.compress,
+        context_budget=args.context_budget,
         contextualize=args.contextualize,
         persist_dir=args.persist_dir,
         chroma_host=args.chroma_host,

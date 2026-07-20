@@ -5,8 +5,8 @@
 2. Cross-encoder (`cross_encoder.py`, `CrossEncoderReranker`) — joint
    (query, chunk) relevance scoring
 """
-from rag.retrieve.rerank.base import RerankStage
-from rag.retrieve.rerank.cross_encoder import CrossEncoderReranker
-from rag.retrieve.rerank.mmr import MMRReranker, mmr_select
+from rag.reranking.base import RerankStage
+from rag.reranking.cross_encoder import CrossEncoderReranker
+from rag.reranking.mmr import MMRReranker, mmr_select
 
 __all__ = ["RerankStage", "CrossEncoderReranker", "MMRReranker", "mmr_select"]

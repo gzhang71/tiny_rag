@@ -12,7 +12,7 @@ carry. lambda=1 is pure relevance; lower values trade relevance for coverage.
 import numpy as np
 
 from rag.ingest.embedder import Embedder
-from rag.retrieve.rerank.base import RerankStage
+from rag.reranking.base import RerankStage
 from rag.store.document import Chunk
 
 

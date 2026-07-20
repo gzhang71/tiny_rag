@@ -6,8 +6,8 @@ that embedding models blur together score highly here.
 import math
 from collections import Counter
 
-from rag.retrieve.retrieve_tunnel.base import RetrieveTunnel
-from rag.retrieve.retrieve_tunnel.text import tokenize as _tokenize
+from rag.retrieval.base import RetrieveTunnel
+from rag.retrieval.text import tokenize as _tokenize
 from rag.store.document import Chunk
 
 

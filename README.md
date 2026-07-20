@@ -9,7 +9,7 @@ pip install -r requirements.txt
 export ANTHROPIC_API_KEY=sk-...
 ```
 
-Most of the system runs locally: embeddings (`all-MiniLM-L6-v2`), all four retrieval channels, spell correction, MMR, and the cross-encoder reranker need no network access. The API key is used for **answer generation** (every query) and the two opt-in Claude stages, `--rewrite` and `--contextualize`. The first run downloads the embedding model (~90 MB) from Hugging Face; `--rerank` additionally downloads the cross-encoder (~90 MB) on first use.
+Most of the system runs locally: embeddings (`all-MiniLM-L6-v2`), all four retrieval channels, spell correction, MMR, the cross-encoder reranker, context compression/packing, and the retrieval metrics need no network access. The API key is used for **answer generation** (every query), the opt-in Claude stages (`--rewrite`, `--decompose`, `--hyde`, `--contextualize`), and the LLM evaluation judge. The first run downloads the embedding model (~90 MB) from Hugging Face; `--rerank` additionally downloads the cross-encoder (~90 MB) on first use.
 
 ## Usage
 
@@ -83,14 +83,23 @@ All four are on by default; pick a subset with `--channels`. Two optional post-f
 - `--mmr [LAMBDA]` — MMR diversity selection: avoids filling the top-k with near-duplicate chunks; lambda in [0,1] trades relevance (1.0) against diversity (default 0.7).
 - `--rerank` — re-score candidates with a local cross-encoder (most accurate, a bit slower).
 
-And two query-preprocessing stages that run before the tunnels:
+And four query-processing stages that run before the tunnels:
 
 - **Spell correction** (on by default, `--no-spell` disables) — query typos are fixed against the ingested corpus vocabulary ("embeding" → "embedding"), so it never needs a dictionary and adapts to domain jargon automatically. Guardrails keep it conservative: only pure-alphabetic words of 4+ characters are candidates, words already in the corpus are never touched, and corrections stay within edit distance 1 (short words) or 2 (longer) — so ticket ids, version strings, and genuinely novel terms pass through untouched. Local, no API call.
 - `--rewrite` — query understanding: Claude rewrites the query for retrieval (expands acronyms and ambiguous references, adds synonyms of key terms, fixes grammar) before the tunnels run, preserving identifiers verbatim. Falls back to the original query if the model declines. One extra API call per query.
+- `--decompose` — query decomposition: Claude splits a multi-hop question into self-contained sub-questions; each is retrieved through every tunnel and all rankings are RRF-fused, so evidence for every part of the question reaches the pool. Atomic questions pass through unchanged. One extra API call per query.
+- `--hyde` — [HyDE](https://arxiv.org/abs/2212.10496): Claude writes a short hypothetical passage that *would* answer the question, and retrieval runs with both the query and the passage — the passage's embedding lands near real answer passages, bridging the question/answer gap in embedding space. One extra API call per query.
+
+And two context-engineering stages that run between retrieval and generation (both local, no API call):
+
+- `--compress` — contextual compression: each retrieved chunk is cut to the sentences most relevant to the query (scored with the local embedder), so the generator's context isn't diluted by the irrelevant halves of chunks.
+- `--context-budget CHARS` — context packing: drops query-time near-duplicate chunks (token-set Jaccard), greedily fits the best-scoring survivors into a character budget, and re-orders them into document order so neighbouring chunks read as continuous text.
 
 ```bash
 python main.py --channels dense,bm25 --mmr --rerank --file doc.txt "What changed in v2.3?"
 python main.py --rewrite --file doc.txt "hw does the ingest pipline work?"
+python main.py --decompose --hyde --file doc.txt "How do dedupe and the Chroma backend interact?"
+python main.py --compress --context-budget 4000 --dir docs/ "Summarize the failure modes"
 ```
 
 ### Which flags should I turn on?
@@ -102,6 +111,10 @@ python main.py --rewrite --file doc.txt "hw does the ingest pipline work?"
 | Chunks in results feel repetitive / near-identical | `--mmr` (lower lambda → more diversity) |
 | Top results are close but ordered badly | `--rerank` (local, adds ~a second) |
 | Queries are terse, jargon-heavy, or full of acronyms | `--rewrite` (1 API call/query) |
+| Questions span several facts / multi-hop | `--decompose` (1 API call/query) |
+| Questions phrased very differently from the documents | `--hyde` (1 API call/query) |
+| Retrieved chunks are long but only partly on-topic | `--compress` (local) |
+| Context window budget is tight / chunks repeat | `--context-budget N` (local) |
 | Chunks lose meaning out of context ("It rose 3%") | `--contextualize` at ingest (1 API call/chunk, biggest accuracy lever) |
 | Corpus grows past ~10k chunks | FAISS `IndexType.HNSW` (Python API) or `--store chroma` |
 | Same corpus queried repeatedly | `--store chroma` — ingest once, unchanged files skipped on re-ingest |
@@ -121,6 +134,10 @@ python main.py --rewrite --file doc.txt "hw does the ingest pipline work?"
 | `--rerank` | off | Cross-encoder rerank stage after fusion/MMR |
 | `--no-spell` | spell on | Disable corpus-vocabulary query spell correction |
 | `--rewrite` | off | LLM query rewrite (query understanding) before retrieval |
+| `--decompose` | off | LLM decomposition of multi-hop questions into sub-questions |
+| `--hyde` | off | HyDE: retrieve with an LLM-written hypothetical answer passage |
+| `--compress` | off | Cut retrieved chunks to their query-relevant sentences (local) |
+| `--context-budget` | off | Pack the generator context into a character budget (local) |
 | `--contextualize` | off | Contextual retrieval: LLM-written chunk context at ingest |
 
 ## Python API
@@ -153,10 +170,38 @@ pipeline = RAGPipeline(mmr_lambda=0.7, rerank=True, query_rewrite=True, contextu
 pipeline.ingest_file("report.pdf")
 print(pipeline.query("What drove the Q3 revenue change?"))
 
+# query expansion + context engineering
+pipeline = RAGPipeline(decompose=True, hyde=True, compress=True, context_budget=4000)
+
 # retrieval without generation — returns [(Chunk, score), ...]
 for chunk, score in pipeline.retriever.retrieve("timeout defaults", top_k=3):
     print(f"{score:.3f}  [{chunk.source}:{chunk.chunk_index}]  {chunk.text[:80]}")
 ```
+
+### Evaluation
+
+Label each question with the sources (or `"source:chunk_index"` chunk ids) that should be retrieved, and run the dataset through the pipeline. Retrieval is scored with Recall@K and NDCG@K locally; pass an `LLMJudge` to also score the generated answers for faithfulness, groundedness, and hallucination rate (one Claude call per example):
+
+```python
+from rag.evaluation import EvalExample, RAGEvaluator
+from rag.evaluation.judge import LLMJudge
+
+dataset = [
+    EvalExample("Who loves cats?", relevant=["pets.txt"]),
+    EvalExample("What are the timeout defaults?", relevant=["config.md:3", "config.md:4"]),
+]
+
+report = RAGEvaluator(pipeline, judge=LLMJudge()).evaluate(dataset)
+print(report.summary())
+# Examples: 2 (top_k=5)
+# recall_at_k: 0.875
+# ndcg_at_k: 0.912
+# faithfulness: 0.940       (supported claims / all claims — RAGAS definition)
+# groundedness: 0.900       (judge's holistic 0-1 score)
+# hallucination_rate: 0.060 (1 - faithfulness)
+```
+
+Per-example detail (retrieved ids, the generated answer, claim-level verdicts) is on `report.results`. Omit `judge=` for a fast, free, retrieval-only run — useful for A/B-testing channels, `--mmr`, `--rerank`, or chunking parameters.
 
 ### `RAGPipeline` parameters
 
@@ -171,6 +216,10 @@ for chunk, score in pipeline.retriever.retrieve("timeout defaults", top_k=3):
 | `rerank` | `False` | Cross-encoder rerank stage (local model) |
 | `spell_correct` | `True` | Corpus-vocabulary query spell correction |
 | `query_rewrite` | `False` | LLM query rewrite before retrieval (1 call/query) |
+| `decompose` | `False` | LLM multi-hop decomposition into sub-questions (1 call/query) |
+| `hyde` | `False` | HyDE hypothetical answer passage (1 call/query) |
+| `compress` | `False` | Extractive sentence compression of retrieved chunks (local) |
+| `context_budget` | `None` (off) | Character budget for the packed generator context |
 | `contextualize` | `False` | Contextual retrieval at ingest (1 call/chunk) |
 | `index_type` | `IndexType.FLAT` | FAISS only: `FLAT` exact or `HNSW` approximate |
 | `persist_dir` | `./chroma_db` | Chroma only: embedded DB directory (`None` = in-memory) |
@@ -194,9 +243,9 @@ INGEST                                QUERY
     headings preserved)                    │
         │                             LLM query rewrite (--rewrite, optional)
         ▼                             acronyms, synonyms, grammar
-   cleaner normalises text                 │
-   (unicode, whitespace,                   │
-    control chars)                         │
+   cleaner normalises text            decompose / HyDE (--decompose / --hyde, opt.)
+   (unicode, whitespace,              fan out into sub-questions / a hypothetical
+    control chars)                    answer passage; every query runs every tunnel
         │                                  ├─────────────┬─────────────┬─────────────┐
         ▼                                  ▼             ▼             ▼             ▼
    chunker packs whole                DenseTunnel    BM25Tunnel   LexicalTunnel  EntityTunnel
@@ -215,19 +264,23 @@ INGEST                                QUERY
    (MiniLM, L2-normalised)               cross-encoder rerank (--rerank, optional)
         │                                joint (query, chunk) scoring
         ▼                                         │
-   vector store add/upsert                        ▼
-   (FAISS in-memory, or                  top-k chunks + question → Claude → streamed answer
-    Chroma persisted to disk)
+   vector store add/upsert               context engineering (optional)
+   (FAISS in-memory, or                  compress (--compress) to on-topic sentences,
+    Chroma persisted to disk)            pack (--context-budget) dedup + budget + doc order
+                                                  │
+                                                  ▼
+                                         top-k chunks + question → Claude → streamed answer
 ```
 
 Step by step for a query:
 
-0. **The query is preprocessed.** Spell correction (on by default) fixes typos against the corpus vocabulary without touching identifiers or novel terms; with `--rewrite`, Claude then rewrites the query for retrieval — expanding acronyms and adding synonyms of key terms.
-1. **Every enabled tunnel searches independently.** Dense embeds the query and searches the vector store; BM25, lexical, and entity search corpus indexes built lazily from the store's chunks (so they also work against a pre-populated Chroma DB). Each returns a ranked `(chunk, score)` list, over-fetching 4× `top_k` when a later stage will cut.
-2. **Reciprocal Rank Fusion merges the lists.** RRF scores by rank position only (`Σ 1/(k + rank)`), so the tunnels' incomparable score scales — cosine, BM25, span length, entity IDF — never need calibrating. Duplicates found by several tunnels rise to the top.
+0. **The query is processed.** Spell correction (on by default) fixes typos against the corpus vocabulary without touching identifiers or novel terms; with `--rewrite`, Claude then rewrites the query for retrieval — expanding acronyms and adding synonyms of key terms. With `--decompose` and/or `--hyde`, the query then fans out into several: self-contained sub-questions of a multi-hop question, and/or a hypothetical answer passage whose embedding lands near real answers.
+1. **Every enabled tunnel searches independently — for every query.** Dense embeds the query and searches the vector store; BM25, lexical, and entity search corpus indexes built lazily from the store's chunks (so they also work against a pre-populated Chroma DB). Each returns a ranked `(chunk, score)` list, over-fetching 4× `top_k` when a later stage will cut.
+2. **Reciprocal Rank Fusion merges the lists.** RRF scores by rank position only (`Σ 1/(k + rank)`), so the tunnels' incomparable score scales — cosine, BM25, span length, entity IDF — never need calibrating. Duplicates found by several tunnels (or several sub-queries) rise to the top.
 3. **MMR (optional)** greedily picks a top-k that trades relevance against redundancy, so the context window isn't spent on near-duplicate chunks.
 4. **Cross-encoder rerank (optional)** re-scores each surviving (query, chunk) pair jointly for the final ordering — the most accurate stage, kept cheap by running only on the candidate pool.
-5. **Generation**: the top-k chunks are formatted with source/score attribution into the context of a Claude request, and the answer streams back.
+5. **Context engineering (optional)**: `--compress` cuts each chunk to the sentences most relevant to the query (local embeddings); `--context-budget` drops query-time near-duplicates, packs the best survivors into a character budget, and re-orders them into document order.
+6. **Generation**: the packed chunks are formatted with source/score attribution into the context of a Claude request, and the answer streams back.
 
 ## Repository architecture
 
@@ -248,28 +301,37 @@ tiny_rag/
     │   ├── document.py            # Chunk dataclass (text, source, chunk_index, metadata)
     │   ├── vector_store.py        # FAISS backend (FLAT exact / HNSW approximate), in-memory
     │   └── chroma_store.py        # Chroma backend: embedded-persistent, server, or ephemeral
-    ├── retrieve/
-    │   ├── retriever.py           # orchestrator: query stages, tunnels, RRF fusion, rerank stages
-    │   ├── query/                 # query preprocessing, applied before the tunnels
-    │   │   ├── base.py            # QueryStage ABC — all stages inherit this
-    │   │   ├── spell.py           # corpus-vocabulary spell correction (local)
-    │   │   └── rewrite.py         # LLM query rewriting via Claude (opt-in)
-    │   ├── retrieve_tunnel/       # the parallel retrieval tunnels
-    │   │   ├── base.py            # RetrieveTunnel ABC — all tunnels inherit this
-    │   │   ├── dense.py           # DenseTunnel: query embedding → vector store search
-    │   │   ├── bm25.py            # BM25Tunnel: Okapi BM25 keyword relevance
-    │   │   ├── lexical.py         # LexicalTunnel: exact phrase/span matching
-    │   │   ├── ner.py             # EntityTunnel: rule-based NER + IDF-weighted entity overlap
-    │   │   └── text.py            # shared tokenizer + stopwords
-    │   └── rerank/                # post-fusion stages, applied in order
-    │       ├── base.py            # RerankStage ABC — all stages inherit this
-    │       ├── mmr.py             # MMR diversity selection
-    │       └── cross_encoder.py   # local cross-encoder reranker (ms-marco-MiniLM-L-6-v2)
+    ├── query_processing/          # transforms the query before the tunnels
+    │   ├── base.py                # QueryStage + QueryExpander ABCs
+    │   ├── spell.py               # corpus-vocabulary spell correction (local)
+    │   ├── rewrite.py             # LLM query rewriting via Claude (opt-in)
+    │   ├── decompose.py           # LLM multi-hop decomposition into sub-questions (opt-in)
+    │   └── hyde.py                # HyDE hypothetical answer passage via Claude (opt-in)
+    ├── retrieval/                 # the parallel retrieval tunnels + the orchestrator
+    │   ├── base.py                # RetrieveTunnel ABC — all tunnels inherit this
+    │   ├── dense.py               # DenseTunnel: query embedding → vector store search
+    │   ├── bm25.py                # BM25Tunnel: Okapi BM25 keyword relevance
+    │   ├── lexical.py             # LexicalTunnel: exact phrase/span matching
+    │   ├── ner.py                 # EntityTunnel: rule-based NER + IDF-weighted entity overlap
+    │   ├── text.py                # shared tokenizer + stopwords
+    │   └── retriever.py           # orchestrator: stages, expanders, tunnels, RRF fusion, rerank
+    ├── reranking/                 # post-fusion stages, applied in order
+    │   ├── base.py                # RerankStage ABC — all stages inherit this
+    │   ├── mmr.py                 # MMR diversity selection
+    │   └── cross_encoder.py       # local cross-encoder reranker (ms-marco-MiniLM-L-6-v2)
+    ├── context_engineering/       # shapes retrieved chunks before generation
+    │   ├── base.py                # ContextStage ABC — all stages inherit this
+    │   ├── compression.py         # extractive sentence compression (local embeddings)
+    │   └── packing.py             # query-time dedup + char budget + document-order packing
+    ├── evaluation/                # measures retrieval and generation quality
+    │   ├── metrics.py             # Recall@K, NDCG@K (pure functions)
+    │   ├── judge.py               # LLM judge: faithfulness, groundedness, hallucination rate
+    │   └── evaluator.py           # RAGEvaluator: dataset → EvalReport
     └── generate/
         └── generator.py           # Claude (claude-opus-4-8) with streaming, cited context
 ```
 
-The dependency direction is one-way: `pipeline` → (`ingest`, `retrieve`, `generate`) → `store`. Tunnels never import each other; the retriever composes them. Swapping a piece (another embedding model, a new tunnel, a different vector DB) means implementing one small ABC — `RetrieveTunnel` for channels, `BaseVectorStore` for stores, `QueryStage` for query preprocessing, `RerankStage` for post-fusion stages.
+The dependency direction is one-way: `pipeline` → (`ingest`, `query_processing`, `retrieval`, `reranking`, `context_engineering`, `generate`) → `store`; `evaluation` sits on top and drives the pipeline. Tunnels never import each other; the retriever composes them. Swapping a piece (another embedding model, a new tunnel, a different vector DB) means implementing one small ABC — `RetrieveTunnel` for channels, `BaseVectorStore` for stores, `QueryStage` / `QueryExpander` for query processing, `RerankStage` for post-fusion stages, `ContextStage` for context engineering.
 
 ## Extending
 
@@ -280,7 +342,7 @@ Each seam in the pipeline is a small ABC; add a class, wire it in, done.
 **A new query-preprocessing stage** (e.g. acronym expansion from a project glossary):
 
 ```python
-from rag.retrieve.query.base import QueryStage
+from rag.query_processing.base import QueryStage
 
 class GlossaryExpander(QueryStage):
     def __init__(self, glossary: dict[str, str]):
@@ -297,9 +359,13 @@ pipeline.retriever.query_stages = (*pipeline.retriever.query_stages, GlossaryExp
 
 **A new retrieval tunnel** — subclass `RetrieveTunnel` (`search(query, top_k) -> list[(Chunk, score)]` + `__len__`). Scores only need to be self-consistent: fusion is rank-based, so they're never compared across tunnels.
 
+**A new query expander** (e.g. multilingual query translation) — subclass `QueryExpander` (`expand(query) -> list[str]`) and append it to `pipeline.retriever.query_expanders`; every returned query runs through every tunnel and the rankings are RRF-fused.
+
 **A new rerank stage** — subclass `RerankStage` (`rerank(query, candidates, top_k)`) and append it to `pipeline.retriever.stages`; each stage receives the previous one's output.
 
-**A better NER model** — `rag/retrieve/retrieve_tunnel/ner.py::extract_entities` is the single swap point; replace the regex rules with a spaCy or transformer NER and the entity tunnel picks it up unchanged.
+**A new context stage** (e.g. LLM summarisation of the packed context) — subclass `ContextStage` (`apply(query, chunks) -> chunks`) and append it to `pipeline.context_stages`; return copies rather than mutating the store's chunks.
+
+**A better NER model** — `rag/retrieval/ner.py::extract_entities` is the single swap point; replace the regex rules with a spaCy or transformer NER and the entity tunnel picks it up unchanged.
 
 **A different embedding model** — `Embedder(model_name="...")` accepts any sentence-transformers model; the stores read the dimension from it. For multilingual corpora, e.g. `paraphrase-multilingual-MiniLM-L12-v2`.
 
@@ -313,9 +379,13 @@ Both backends consume the same L2-normalised embeddings and return cosine-simila
 
 **Ingest** — `.txt`, `.md`, `.pdf`, `.html`, and `.docx` are extracted to text with headings preserved as markdown `#` lines. Documents are normalised (unicode, whitespace, control characters), split along section headings and sentence boundaries (chunks never cut mid-sentence and carry their heading breadcrumb, e.g. `[Configuration > Timeouts]`), quality-filtered (page numbers, separator lines), and deduplicated — exact copies by token-set signature, near-duplicates by SimHash. A source whose content hash is unchanged since its last ingest is skipped entirely (hashes and dedup state persist with the Chroma store). Chunks are capped by a warning when `chunk_size` exceeds the embedding model's token window. Optional contextual retrieval (`--contextualize`) prepends a Claude-written 1-2 sentence situating context to every chunk — the document is prompt-cached, so per-chunk calls read it at ~10% input price.
 
-**Query preprocessing** — spell correction (on by default) fixes query typos against the corpus's own vocabulary — local, dependency-free, and safe for identifiers; optional LLM query rewriting (`--rewrite`) has Claude reformulate the query (acronyms, synonyms, grammar) before retrieval.
+**Query processing** — spell correction (on by default) fixes query typos against the corpus's own vocabulary — local, dependency-free, and safe for identifiers; optional LLM query rewriting (`--rewrite`) has Claude reformulate the query (acronyms, synonyms, grammar) before retrieval. Two optional expanders then fan the query out: decomposition (`--decompose`) splits multi-hop questions into self-contained sub-questions, and HyDE (`--hyde`) adds a hypothetical answer passage; every query runs through every tunnel and all rankings are RRF-fused.
 
-**Retrieval** — multi-tunnel: dense vectors for meaning, BM25 for keywords, exact phrase match for verbatim quotes, and entity overlap (rule-based NER) for ids/names/dates. Ranked lists are merged with Reciprocal Rank Fusion, which is rank-based so the tunnels' different score scales never need calibrating. Optional Maximal Marginal Relevance selection then picks a top-k that covers different aspects instead of near-duplicates, and an optional cross-encoder reranker (`ms-marco-MiniLM-L-6-v2`, local) re-scores for the final ordering.
+**Retrieval** — multi-tunnel hybrid search: dense vectors for meaning, BM25 for keywords, exact phrase match for verbatim quotes, and entity overlap (rule-based NER) for ids/names/dates. Ranked lists are merged with Reciprocal Rank Fusion, which is rank-based so the tunnels' different score scales never need calibrating. Optional Maximal Marginal Relevance selection then picks a top-k that covers different aspects instead of near-duplicates, and an optional cross-encoder reranker (`ms-marco-MiniLM-L-6-v2`, local) re-scores for the final ordering.
+
+**Context engineering** — optional, local stages between retrieval and generation: `--compress` cuts each chunk to its query-relevant sentences (embedding-scored, original order preserved), and `--context-budget` deduplicates near-identical chunks, packs the best survivors into a character budget, and re-orders them into document order. Neither mutates the store — compressed chunks are copies.
+
+**Evaluation** — `rag/evaluation/` scores retrieval with Recall@K and NDCG@K against labelled examples (local, free) and, with `LLMJudge`, scores generated answers claim-by-claim for faithfulness, groundedness, and hallucination rate via a structured-output Claude call. See the Evaluation section above for usage.
 
 **Embeddings** — `all-MiniLM-L6-v2` via sentence-transformers (runs locally, no API key needed).
 
